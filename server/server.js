@@ -15,7 +15,7 @@ const subjects = [
   { id: "renewable-energy-resource", _id: "renewable-energy-resource", name: "Renewable Energy Resource", code: "RER-401", department: "CSE", faculty: { name: "Dr. Anjali Sharma" }, facultyName: "Dr. Anjali Sharma", students: [], status: "Active", active: true },
   { id: "artificial-intelligence", _id: "artificial-intelligence", name: "Artificial Intelligence", code: "AI-402", department: "CSE", faculty: { name: "Dr. Rahul Verma" }, facultyName: "Dr. Rahul Verma", students: [], status: "Active", active: true },
   { id: "cloud-computing", _id: "cloud-computing", name: "Cloud Computing", code: "CC-403", department: "CSE", faculty: { name: "Prof. Neha Gupta" }, facultyName: "Prof. Neha Gupta", students: [], status: "Active", active: true },
-  { id: "reasoning-soft-skill", _id: "reasoning-soft-skill", name: "Reasoning and Soft Skill", code: "RSS-404", department: "CSE", faculty: { name: "Ms. Priya Singh" }, facultyName: "Ms. Priya Singh", students: [], status: "Active", active: true }
+  { id: "soft-skill", _id: "soft-skill", name: "Reasoning and Soft Skill", code: "RSS-404", department: "CSE", faculty: { name: "Ms. Priya Singh" }, facultyName: "Ms. Priya Singh", students: [], status: "Active", active: true }
 ];
 const attendance = [];
 
@@ -102,30 +102,9 @@ app.put("/api/user/profile", requireUser, async (req, res) => {
     }
   }
 
-  const previousName = req.user.name;
-  const updatedName = name.trim();
-  req.user.name = updatedName;
+  req.user.name = name.trim();
   req.user.department = department.trim();
   req.user.profilePhoto = savedPhoto;
-
-  // Keep existing dashboard/search data in sync after a user changes their
-  // display name. Attendance entries store a snapshot for quick listing.
-  for (const item of attendance) {
-    if (item.studentId === req.user.id) {
-      item.studentName = updatedName;
-      if (item.student) item.student.name = updatedName;
-    }
-    if (item.facultyId === req.user.id || item.facultyName === previousName) {
-      item.facultyName = updatedName;
-      if (item.faculty) item.faculty.name = updatedName;
-    }
-  }
-  for (const subject of subjects) {
-    if (subject.facultyId === req.user.id) {
-      subject.facultyName = updatedName;
-      if (subject.faculty) subject.faculty.name = updatedName;
-    }
-  }
   res.json({ message: "Profile updated successfully.", user: publicUser(req.user) });
 });
 
@@ -137,31 +116,10 @@ app.get("/api/subjects/available", requireUser, (_req, res) => res.json({ subjec
 app.get("/api/subjects/my", requireUser, (req, res) => res.json({ subjects: subjects.filter((subject) => subject.facultyId === req.user.id) }));
 app.post("/api/subjects", requireUser, (req, res) => {
   if (req.user.role !== "faculty") return res.status(403).json({ message: "Only faculty can create subjects." });
-  const { name, code, department } = req.body;
-  if (!name?.trim() || !code?.trim() || !department?.trim()) {
-    return res.status(400).json({ message: "Subject name, code and department are required." });
-  }
   const id = randomUUID();
-  const subject = { id, _id: id, name: name.trim(), code: code.trim(), department: department.trim(), facultyId: req.user.id, facultyName: req.user.name, faculty: { name: req.user.name }, status: "Active", students: [], active: true };
+  const subject = { id, _id: id, ...req.body, facultyId: req.user.id, facultyName: req.user.name, faculty: { name: req.user.name }, status: "Active", students: [], active: true };
   subjects.push(subject);
   res.status(201).json({ message: "Subject created", subject });
-});
-app.put("/api/subjects/:id", requireUser, (req, res) => {
-  if (req.user.role !== "faculty") return res.status(403).json({ message: "Only faculty can edit subjects." });
-  const subject = subjects.find((item) => item.id === req.params.id && item.facultyId === req.user.id);
-  if (!subject) return res.status(404).json({ message: "Subject not found." });
-  const { name, code, department, status } = req.body;
-  if (!name?.trim() || !code?.trim() || !department?.trim()) {
-    return res.status(400).json({ message: "Subject name, code and department are required." });
-  }
-  subject.name = name.trim();
-  subject.code = code.trim();
-  subject.department = department.trim();
-  if (status === "Active" || status === "Inactive") {
-    subject.status = status;
-    subject.active = status === "Active";
-  }
-  res.json({ message: "Subject updated successfully.", subject });
 });
 app.delete("/api/subjects/:id", requireUser, (req, res) => {
   const index = subjects.findIndex((subject) => subject.id === req.params.id && subject.facultyId === req.user.id);
