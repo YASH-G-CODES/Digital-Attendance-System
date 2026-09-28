@@ -1,167 +1,241 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
-import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import mongoose from "mongoose";
+import { randomUUID, scrypt as scryptCallback, timingSafeEqual } from "node:crypto";
+import { promisify } from "node:util";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+const scrypt = promisify(scryptCallback);
 const app = express();
 const port = Number(process.env.PORT || 5000);
 const serverDirectory = path.dirname(fileURLToPath(import.meta.url));
-const studentPhotoDirectory = path.join(serverDirectory, "uploads", "student-photos");
-const users = [];
-const subjects = [
-  { id: "renewable-energy-resource", _id: "renewable-energy-resource", name: "Renewable Energy Resource", code: "RER-401", department: "CSE", faculty: { name: "Dr. Anjali Sharma" }, facultyName: "Dr. Anjali Sharma", students: [], status: "Active", active: true },
-  { id: "artificial-intelligence", _id: "artificial-intelligence", name: "Artificial Intelligence", code: "AI-402", department: "CSE", faculty: { name: "Dr. Rahul Verma" }, facultyName: "Dr. Rahul Verma", students: [], status: "Active", active: true },
-  { id: "cloud-computing", _id: "cloud-computing", name: "Cloud Computing", code: "CC-403", department: "CSE", faculty: { name: "Prof. Neha Gupta" }, facultyName: "Prof. Neha Gupta", students: [], status: "Active", active: true },
-  { id: "soft-skill", _id: "soft-skill", name: "Reasoning and Soft Skill", code: "RSS-404", department: "CSE", faculty: { name: "Ms. Priya Singh" }, facultyName: "Ms. Priya Singh", students: [], status: "Active", active: true }
-];
-const attendance = [];
+const clientBuildDirectory = path.resolve(serverDirectory, "../client/dist");
+const MAX_PHOTO_BYTES = 2 * 1024 * 1024;
+const roles = ["student", "faculty", "admin"];
 
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:5173" }));
-app.use(express.json({ limit: "10mb" }));
-app.use("/uploads", express.static(path.join(serverDirectory, "uploads")));
+const userSchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true }, name: { type: String, required: true },
+  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true }, role: { type: String, enum: roles, default: "student" },
+  department: { type: String, default: "" }, facultyStatus: { type: String, default: "approved" },
+  token: { type: String, default: "" }, photoMime: { type: String, default: "" }, photoData: { type: Buffer, default: null }
+}, { timestamps: true });
+const subjectSchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true }, name: String, code: String, department: String,
+  facultyId: String, facultyName: String, faculty: mongoose.Schema.Types.Mixed,
+  students: { type: [String], default: [] }, status: { type: String, default: "Active" }, active: { type: Boolean, default: true }
+}, { timestamps: true, strict: false });
+const attendanceSchema = new mongoose.Schema({ id: { type: String, required: true, unique: true }, studentId: String }, { timestamps: true, strict: false });
+const User = mongoose.model("User", userSchema);
+const Subject = mongoose.model("Subject", subjectSchema);
+const Attendance = mongoose.model("Attendance", attendanceSchema);
 
-const publicUser = ({ password, ...user }) => user;
-const currentUser = (req) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  return users.find((user) => user.token === token);
+app.use(cors());
+app.use(express.json({ limit: "4mb" }));
+
+const publicUser = (user) => {
+  if (!user) return user;
+  const value = typeof user.toObject === "function" ? user.toObject() : user;
+  const { password, token, photoData, photoMime, _id, __v, ...safe } = value;
+  return { ...safe, profilePhoto: photoData?.length ? `/api/users/${safe.id}/photo` : "" };
 };
-const requireUser = (req, res, next) => {
-  const user = currentUser(req);
-  if (!user) return res.status(401).json({ message: "Please sign in again." });
-  req.user = user;
+const hashPassword = async (password) => {
+  const salt = randomUUID();
+  const key = await scrypt(password, salt, 64);
+  return `scrypt:${salt}:${key.toString("hex")}`;
+};
+const verifyPassword = async (password, stored) => {
+  const [scheme, salt, keyHex] = String(stored).split(":");
+  if (scheme !== "scrypt" || !salt || !keyHex) return false;
+  const expected = Buffer.from(keyHex, "hex");
+  const actual = await scrypt(password, salt, expected.length);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+};
+const parsePhoto = (dataUrl) => {
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(dataUrl || "");
+  if (!match) return { error: "Please choose a valid JPG, PNG, or WEBP photo." };
+  const data = Buffer.from(match[2], "base64");
+  if (!data.length || data.length > MAX_PHOTO_BYTES) return { error: "Photo must be 2 MB or smaller." };
+  return { photoMime: match[1], photoData: data };
+};
+const currentUser = async (req) => {
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, "");
+  return token ? User.findOne({ token }).lean() : null;
+};
+const requireUser = async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    if (!user) return res.status(401).json({ message: "Please sign in again." });
+    req.user = user;
+    next();
+  } catch (error) { next(error); }
+};
+const requireRole = (role) => (req, res, next) => {
+  if (req.user.role !== role && req.user.role !== "admin") return res.status(403).json({ message: `Only ${role} accounts can do this.` });
   next();
 };
 
-app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "Digital Attendance API" }));
+app.get("/api/health", (_req, res) => res.json({ status: mongoose.connection.readyState === 1 ? "ok" : "starting", service: "Digital Attendance API", database: mongoose.connection.readyState === 1 ? "connected" : "disconnected" }));
 
-app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password, role = "student", department = "", studentPhoto = "" } = req.body;
-  if (!name || !email || !password) return res.status(400).json({ message: "Name, email and password are required." });
-  if (users.some((user) => user.email.toLowerCase() === email.toLowerCase())) return res.status(409).json({ message: "This email is already registered." });
-
-  let profilePhoto = "";
-  if (role === "student") {
-    const photoMatch = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(studentPhoto);
-    if (!photoMatch) return res.status(400).json({ message: "A valid JPG, PNG, or WEBP student photo is required." });
-
-    const photoBuffer = Buffer.from(photoMatch[2], "base64");
-    if (!photoBuffer.length || photoBuffer.length > 5 * 1024 * 1024) {
-      return res.status(400).json({ message: "Student photo must be smaller than 5 MB." });
+app.post("/api/auth/register", async (req, res, next) => {
+  try {
+    const { name, email, password, role = "student", department = "", studentPhoto = "" } = req.body;
+    if (!name?.trim() || !email?.trim() || !password) return res.status(400).json({ message: "Name, email and password are required." });
+    if (!roles.includes(role) || role === "admin") return res.status(400).json({ message: "Please select a valid account role." });
+    if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
+    let photo = {};
+    if (role === "student") {
+      photo = parsePhoto(studentPhoto);
+      if (photo.error) return res.status(400).json({ message: photo.error });
     }
-
-    const photoExtension = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[photoMatch[1]];
-    const photoFileName = `${randomUUID()}.${photoExtension}`;
-    try {
-      await mkdir(studentPhotoDirectory, { recursive: true });
-      await writeFile(path.join(studentPhotoDirectory, photoFileName), photoBuffer);
-      profilePhoto = `/uploads/student-photos/${photoFileName}`;
-    } catch (error) {
-      console.error("Unable to save student photo:", error);
-      return res.status(500).json({ message: "Unable to save the student photo. Please try again." });
-    }
+    const user = await User.create({ id: randomUUID(), name: name.trim(), email: email.trim().toLowerCase(), password: await hashPassword(password), role, department: department.trim(), facultyStatus: role === "faculty" ? "pending" : "approved", ...photo });
+    res.status(201).json({ message: "Registration successful. You can now sign in.", user: publicUser(user) });
+  } catch (error) {
+    if (error.code === 11000) return res.status(409).json({ message: "This email is already registered." });
+    next(error);
   }
-
-  users.push({ id: randomUUID(), name, email: email.toLowerCase(), password, role, department, profilePhoto, facultyStatus: role === "faculty" ? "pending" : "approved" });
-  res.status(201).json({ message: "Registration successful. You can now sign in." });
+});
+app.post("/api/auth/login", async (req, res, next) => {
+  try {
+    const user = await User.findOne({ email: String(req.body.email || "").trim().toLowerCase() });
+    if (!user || !(await verifyPassword(String(req.body.password || ""), user.password))) return res.status(401).json({ message: "Invalid email or password. Register first if you do not have an account." });
+    user.token = randomUUID();
+    await user.save();
+    res.json({ token: user.token, user: publicUser(user), message: "Login successful" });
+  } catch (error) { next(error); }
+});
+app.get("/api/users/:id/photo", async (req, res, next) => {
+  try {
+    const user = await User.findOne({ id: req.params.id }).select("photoData photoMime").lean();
+    if (!user?.photoData?.length) return res.sendStatus(404);
+    res.type(user.photoMime).set("Cache-Control", "public, max-age=3600").send(user.photoData);
+  } catch (error) { next(error); }
+});
+app.put("/api/user/profile", requireUser, async (req, res, next) => {
+  try {
+    const { name, department, profilePhoto = "" } = req.body;
+    if (!name?.trim() || !department?.trim()) return res.status(400).json({ message: "Name and department are required." });
+    const changes = { name: name.trim(), department: department.trim() };
+    if (profilePhoto) {
+      const photo = parsePhoto(profilePhoto);
+      if (photo.error) return res.status(400).json({ message: photo.error });
+      Object.assign(changes, photo);
+    }
+    const user = await User.findOneAndUpdate({ id: req.user.id }, changes, { new: true });
+    res.json({ message: "Profile updated successfully.", user: publicUser(user) });
+  } catch (error) { next(error); }
 });
 
-app.post("/api/auth/login", (req, res) => {
-  const { email, password } = req.body;
-  const user = users.find((item) => item.email === String(email).toLowerCase() && item.password === password);
-  if (!user) return res.status(401).json({ message: "Invalid email or password. Register first if you do not have an account." });
-  user.token = randomUUID();
-  res.json({ token: user.token, user: publicUser(user), message: "Login successful" });
-});
-
-app.put("/api/user/profile", requireUser, async (req, res) => {
-  const { name, department, profilePhoto = "" } = req.body;
-  if (!name?.trim() || !department?.trim()) {
-    return res.status(400).json({ message: "Name and department are required." });
-  }
-
-  let savedPhoto = req.user.profilePhoto;
-  if (profilePhoto) {
-    const photoMatch = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(profilePhoto);
-    if (!photoMatch) return res.status(400).json({ message: "Please choose a valid JPG, PNG, or WEBP photo." });
-    const photoBuffer = Buffer.from(photoMatch[2], "base64");
-    if (!photoBuffer.length || photoBuffer.length > 5 * 1024 * 1024) {
-      return res.status(400).json({ message: "Profile photo must be smaller than 5 MB." });
-    }
-    const extension = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" }[photoMatch[1]];
-    const photoFileName = `${randomUUID()}.${extension}`;
-    try {
-      await mkdir(studentPhotoDirectory, { recursive: true });
-      await writeFile(path.join(studentPhotoDirectory, photoFileName), photoBuffer);
-      savedPhoto = `/uploads/student-photos/${photoFileName}`;
-    } catch (error) {
-      console.error("Unable to update profile photo:", error);
-      return res.status(500).json({ message: "Unable to save the profile photo. Please try again." });
-    }
-  }
-
-  req.user.name = name.trim();
-  req.user.department = department.trim();
-  req.user.profilePhoto = savedPhoto;
-  res.json({ message: "Profile updated successfully.", user: publicUser(req.user) });
-});
-
-app.post("/api/auth/forgot-password", (_req, res) => res.json({ message: "Password reset is unavailable in the local development API." }));
+app.post("/api/auth/forgot-password", (_req, res) => res.status(501).json({ message: "Password reset email service is not configured." }));
 app.post("/api/auth/verify-reset-otp", (_req, res) => res.status(501).json({ message: "OTP email service is not configured." }));
 app.post("/api/auth/reset-password", (_req, res) => res.status(501).json({ message: "OTP email service is not configured." }));
 
-app.get("/api/subjects/available", requireUser, (_req, res) => res.json({ subjects }));
-app.get("/api/subjects/my", requireUser, (req, res) => res.json({ subjects: subjects.filter((subject) => subject.facultyId === req.user.id) }));
-app.post("/api/subjects", requireUser, (req, res) => {
-  if (req.user.role !== "faculty") return res.status(403).json({ message: "Only faculty can create subjects." });
-  const id = randomUUID();
-  const subject = { id, _id: id, ...req.body, facultyId: req.user.id, facultyName: req.user.name, faculty: { name: req.user.name }, status: "Active", students: [], active: true };
-  subjects.push(subject);
-  res.status(201).json({ message: "Subject created", subject });
+app.get("/api/subjects/available", requireUser, async (_req, res, next) => { try { res.json({ subjects: await Subject.find().lean() }); } catch (error) { next(error); } });
+app.get("/api/subjects/my", requireUser, async (req, res, next) => { try { res.json({ subjects: await Subject.find({ facultyId: req.user.id }).lean() }); } catch (error) { next(error); } });
+app.post("/api/subjects", requireUser, requireRole("faculty"), async (req, res, next) => {
+  try {
+    const { name, code, department } = req.body;
+    if (!name || !code) return res.status(400).json({ message: "Subject name and code are required." });
+    const id = randomUUID();
+    const subject = await Subject.create({ id, name, code, department, facultyId: req.user.id, facultyName: req.user.name, faculty: { name: req.user.name }, status: "Active", students: [], active: true });
+    res.status(201).json({ message: "Subject created", subject });
+  } catch (error) { next(error); }
 });
-app.delete("/api/subjects/:id", requireUser, (req, res) => {
-  const index = subjects.findIndex((subject) => subject.id === req.params.id && subject.facultyId === req.user.id);
-  if (index < 0) return res.status(404).json({ message: "Subject not found." });
-  subjects.splice(index, 1);
-  res.json({ message: "Subject deleted" });
+app.put("/api/subjects/:id", requireUser, requireRole("faculty"), async (req, res, next) => {
+  try {
+    const subject = await Subject.findOneAndUpdate({ id: req.params.id, facultyId: req.user.id }, req.body, { new: true });
+    if (!subject) return res.status(404).json({ message: "Subject not found." });
+    res.json({ message: "Subject updated", subject });
+  } catch (error) { next(error); }
 });
-app.post("/api/subjects/:id/join", requireUser, (req, res) => {
-  const subject = subjects.find((item) => item.id === req.params.id);
-  if (!subject) return res.status(404).json({ message: "Subject not found." });
-  if (!subject.students.includes(req.user.id)) subject.students.push(req.user.id);
-  res.json({ message: "Subject joined" });
+app.delete("/api/subjects/:id", requireUser, requireRole("faculty"), async (req, res, next) => {
+  try {
+    const result = await Subject.deleteOne({ id: req.params.id, facultyId: req.user.id });
+    if (!result.deletedCount) return res.status(404).json({ message: "Subject not found." });
+    res.json({ message: "Subject deleted" });
+  } catch (error) { next(error); }
 });
-app.delete("/api/subjects/:id/leave", requireUser, (req, res) => {
-  const subject = subjects.find((item) => item.id === req.params.id);
-  if (subject) subject.students = subject.students.filter((id) => id !== req.user.id);
-  res.json({ message: "Subject left" });
+app.post("/api/subjects/:id/join", requireUser, async (req, res, next) => {
+  try {
+    const subject = await Subject.findOneAndUpdate({ id: req.params.id }, { $addToSet: { students: req.user.id } }, { new: true });
+    if (!subject) return res.status(404).json({ message: "Subject not found." });
+    res.json({ message: "Subject joined" });
+  } catch (error) { next(error); }
 });
+app.delete("/api/subjects/:id/leave", requireUser, async (req, res, next) => { try { await Subject.updateOne({ id: req.params.id }, { $pull: { students: req.user.id } }); res.json({ message: "Subject left" }); } catch (error) { next(error); } });
 
-app.get("/api/attendance/records", requireUser, (_req, res) => res.json(attendance));
-app.get("/api/attendance/history/:userId", requireUser, (req, res) => res.json(attendance.filter((item) => item.studentId === req.params.userId)));
-app.get("/api/attendance/pending", requireUser, (_req, res) => res.json([]));
-app.post("/api/attendance/self", requireUser, (req, res) => {
-  const item = { id: randomUUID(), studentId: req.user.id, studentName: req.user.name, ...req.body, status: "Present", createdAt: new Date().toISOString() };
-  attendance.push(item);
-  res.status(201).json({ message: "Attendance marked", attendance: item });
+app.get("/api/attendance/records", requireUser, async (_req, res, next) => { try { res.json(await Attendance.find().lean()); } catch (error) { next(error); } });
+app.get("/api/attendance/history/:userId", requireUser, async (req, res, next) => { try { res.json(await Attendance.find({ studentId: req.params.userId }).lean()); } catch (error) { next(error); } });
+app.get("/api/attendance/pending", requireUser, async (_req, res, next) => { try { res.json(await Attendance.find({ status: { $in: ["Pending", "pending"] } }).lean()); } catch (error) { next(error); } });
+app.post("/api/attendance/self", requireUser, async (req, res, next) => {
+  try {
+    const item = await Attendance.create({ id: randomUUID(), studentId: req.user.id, studentName: req.user.name, ...req.body, status: "Present", createdAt: new Date() });
+    res.status(201).json({ message: "Attendance marked", attendance: item });
+  } catch (error) { next(error); }
 });
 app.post("/api/attendance/verify-selfie", requireUser, (_req, res) => res.status(503).json({ message: "Face recognition service is not ready yet." }));
 app.post("/api/attendance/recognize-group", requireUser, (_req, res) => res.status(503).json({ message: "Face recognition service is not ready yet." }));
-app.post("/api/attendance/mark", requireUser, (_req, res) => res.status(201).json({ message: "Attendance submitted for review." }));
-app.put("/api/attendance/:action/:id", requireUser, (_req, res) => res.json({ message: "Attendance updated" }));
+app.post("/api/attendance/mark", requireUser, async (req, res, next) => { try { await Attendance.create({ id: randomUUID(), studentId: req.user.id, studentName: req.user.name, ...req.body, status: "Pending", createdAt: new Date() }); res.status(201).json({ message: "Attendance submitted for review." }); } catch (error) { next(error); } });
+app.put("/api/attendance/:action/:id", requireUser, async (req, res, next) => {
+  try {
+    const status = req.params.action === "approve" ? "Approved" : req.params.action === "reject" ? "Rejected" : req.params.action === "finalize" ? "Finalized" : null;
+    if (!status) return res.status(400).json({ message: "Invalid attendance action." });
+    const item = await Attendance.findOneAndUpdate({ id: req.params.id }, { status }, { new: true });
+    if (!item) return res.status(404).json({ message: "Attendance record not found." });
+    res.json({ message: `Attendance ${status.toLowerCase()}`, attendance: item });
+  } catch (error) { next(error); }
+});
 
-app.get("/api/admin/users", requireUser, (_req, res) => res.json(users.map(publicUser)));
-app.get("/api/admin/faculty", requireUser, (_req, res) => res.json(users.filter((user) => user.role === "faculty").map(publicUser)));
-app.get("/api/admin/settings", requireUser, (_req, res) => res.json({ campusLatitude: process.env.CAMPUS_LATITUDE || "", campusLongitude: process.env.CAMPUS_LONGITUDE || "", campusRadius: process.env.CAMPUS_RADIUS || 150 }));
-app.put("/api/admin/faculty/:id/:action", requireUser, (req, res) => {
-  const faculty = users.find((user) => user.id === req.params.id && user.role === "faculty");
-  if (!faculty) return res.status(404).json({ message: "Faculty member not found." });
-  faculty.facultyStatus = req.params.action === "approve" ? "approved" : "rejected";
-  res.json({ message: `Faculty ${faculty.facultyStatus}` });
+app.get("/api/admin/users", requireUser, requireRole("admin"), async (_req, res, next) => { try { res.json((await User.find().lean()).map(publicUser)); } catch (error) { next(error); } });
+app.get("/api/admin/faculty", requireUser, requireRole("admin"), async (_req, res, next) => { try { res.json((await User.find({ role: "faculty" }).lean()).map(publicUser)); } catch (error) { next(error); } });
+app.get("/api/admin/settings", requireUser, requireRole("admin"), (_req, res) => res.json({ campusLatitude: process.env.CAMPUS_LATITUDE || "", campusLongitude: process.env.CAMPUS_LONGITUDE || "", campusRadius: process.env.CAMPUS_RADIUS || 150 }));
+app.put("/api/admin/faculty/:id/:action", requireUser, requireRole("admin"), async (req, res, next) => {
+  try {
+    const facultyStatus = req.params.action === "approve" ? "approved" : req.params.action === "reject" ? "rejected" : null;
+    if (!facultyStatus) return res.status(400).json({ message: "Invalid faculty action." });
+    const faculty = await User.findOneAndUpdate({ id: req.params.id, role: "faculty" }, { facultyStatus }, { new: true });
+    if (!faculty) return res.status(404).json({ message: "Faculty member not found." });
+    res.json({ message: `Faculty ${faculty.facultyStatus}` });
+  } catch (error) { next(error); }
 });
 app.get("/api/user/faculty-profile", requireUser, (req, res) => res.json(publicUser(req.user)));
 
-app.use((_req, res) => res.status(404).json({ message: "API route not found." }));
-app.listen(port, () => console.log(`Digital Attendance API running on http://127.0.0.1:${port}`));
+app.use("/api", (_req, res) => res.status(404).json({ message: "API route not found." }));
+app.use(express.static(clientBuildDirectory));
+app.get("*path", (_req, res) => res.sendFile(path.join(clientBuildDirectory, "index.html")));
+app.use((error, _req, res, _next) => {
+  console.error("Request failed:", error);
+  if (error.name === "ValidationError") return res.status(400).json({ message: error.message });
+  res.status(500).json({ message: "Server error. Please try again." });
+});
+
+const defaultSubjects = [
+  { id: "renewable-energy-resource", name: "Renewable Energy Resource", code: "RER-401", department: "CSE", facultyName: "Dr. Anjali Sharma" },
+  { id: "artificial-intelligence", name: "Artificial Intelligence", code: "AI-402", department: "CSE", facultyName: "Dr. Rahul Verma" },
+  { id: "cloud-computing", name: "Cloud Computing", code: "CC-403", department: "CSE", facultyName: "Prof. Neha Gupta" },
+  { id: "soft-skill", name: "Reasoning and Soft Skill", code: "RSS-404", department: "CSE", facultyName: "Ms. Priya Singh" }
+];
+
+if (!process.env.MONGO_URI) {
+  console.error("MONGO_URI is required. Add a MongoDB Atlas connection string to the environment.");
+  process.exit(1);
+}
+try {
+  await mongoose.connect(process.env.MONGO_URI);
+  if (process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD && process.env.ADMIN_NAME) {
+    const adminEmail = process.env.ADMIN_EMAIL.trim().toLowerCase();
+    if (!(await User.exists({ email: adminEmail }))) {
+      await User.create({ id: randomUUID(), name: process.env.ADMIN_NAME.trim(), email: adminEmail, password: await hashPassword(process.env.ADMIN_PASSWORD), role: "admin", facultyStatus: "approved" });
+      console.log(`Initial admin account created for ${adminEmail}.`);
+    }
+  }
+  if (await Subject.estimatedDocumentCount() === 0) {
+    await Subject.insertMany(defaultSubjects.map((subject) => ({ ...subject, faculty: { name: subject.facultyName }, students: [], status: "Active", active: true })));
+  }
+  app.listen(port, "0.0.0.0", () => console.log(`Digital Attendance app listening on port ${port}; MongoDB connected.`));
+} catch (error) {
+  console.error("Unable to connect to MongoDB:", error.message);
+  process.exit(1);
+}

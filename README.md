@@ -156,9 +156,19 @@ Create local environment files from the examples. Never commit real values.
 
 - `VITE_API_BASE_URL`
 
-## Deployment Status
+## Deploy on Render with one app URL
 
-Deployment is not yet configured. The project currently targets local development. Production deployment will require managed secrets, HTTPS, persistent and protected upload storage, a hosted MongoDB instance, private or authenticated AI-service communication, monitoring, backups, and additional production testing.
+The root `render.yaml` creates one Render web service. It builds the React client and serves its files from the Express server, so the site and `/api` endpoints share one URL. MongoDB Atlas stores accounts, subjects, attendance records, and profile photos persistently.
+
+1. Create a MongoDB Atlas cluster and database user. Add `0.0.0.0/0` to Atlas Network Access if the Render outbound IP is not fixed, and copy the connection string.
+2. In Render, create a Blueprint from this repository and set the service's `MONGO_URI` secret to the Atlas connection string.
+3. Open the Render service URL. Its `/api/health` endpoint should report `database: "connected"`.
+
+To enable the admin dashboard, set `ADMIN_NAME`, `ADMIN_EMAIL`, and `ADMIN_PASSWORD` in the Render service environment before its first startup. The backend creates that admin account once; use those values to sign in. Set a strong unique password and keep it private.
+
+For manual setup, use repository root as the Render root directory, `npm run build` as the build command, and `npm start` as the start command. Set `MONGO_URI` in the service environment. `VITE_API_BASE_URL` defaults to `/api`, so no separate frontend service or frontend API URL is needed.
+
+For local development, put `MONGO_URI` in `server/.env`; the frontend uses the Vite proxy at `/api`.
 
 ## Project Context
 

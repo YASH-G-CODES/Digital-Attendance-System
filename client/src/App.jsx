@@ -122,9 +122,9 @@ function App() {
             return;
         }
 
-        if (file.size > 4 * 1024 * 1024) {
+        if (file.size > 2 * 1024 * 1024) {
             setStudentPhoto("");
-            setStudentPhotoError("Photo must be smaller than 4 MB.");
+            setStudentPhotoError("Photo must be 2 MB or smaller.");
             event.target.value = "";
             return;
         }
@@ -416,8 +416,8 @@ function App() {
         const handleProfilePhotoChange = (event) => {
             const file = event.target.files?.[0];
             if (!file) return;
-            if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 4 * 1024 * 1024) {
-                alert("Please choose a JPG, PNG, or WEBP image smaller than 4 MB.");
+            if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+                alert("Please choose a JPG, PNG, or WEBP image that is 2 MB or smaller.");
                 event.target.value = "";
                 return;
             }
@@ -1459,7 +1459,7 @@ function App() {
                                             required
                                         />
 
-                                        <small>Upload a clear face photo (JPG, PNG, or WEBP; max 4 MB).</small>
+                                        <small>Upload a clear face photo (JPG, PNG, or WEBP; max 2 MB).</small>
 
                                         {studentPhoto && (
                                             <img
